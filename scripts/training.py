@@ -14,11 +14,45 @@ from sklearn.model_selection import train_test_split
 tf.config.threading.set_inter_op_parallelism_threads(4)
 tf.config.threading.set_intra_op_parallelism_threads(4)
 
+#set up paths for dataset, model, and logs
 base_dir = os.path.join(os.path.expanduser('~'), 'Desktop/ml/audio_processing')
 dataset_dir = os.path.join(base_dir, 'dataset')
 dataset_path = os.path.join(dataset_dir, 'dataset_commands-002.gz')
 models_dir = os.path.join(base_dir, 'model')
 logs_dir = os.path.join(base_dir, 'logs')
+
+#custom layer to apply channel attention mechanism
+class ChannelAttention(tf.keras.layers.Layer):
+    #initialize layer with specified ratio for dimensionality reduction
+    def __init__(self, ratio = 8, **kwargs):
+        super(ChannelAttention, self).__init__(**kwargs)
+        self.ratio = ratio
+        self.avg_pool = layers.GlobalAveragePooling2D() #global avg pooling
+        self.max_pool = layers.GlobalMaxPooling2D()     #global max pooling
+
+    #define the layer structure based on input shape
+    def build(self, input_shape):
+        #fully connected layers: first layer reduces dimension using ratio
+        self.fc1 = layers.Dense(units = input_shape[-1] // self.ratio, activation = 'relu')
+        #second layer restores original dimension with sigmoid activation for scaling
+        self.fc2 = layers.Dense(units = input_shape[-1], activation = 'sigmoid')
+
+    #apply attention mechanism to input
+    def call(self, inputs):
+        #average and max pooling to capture global spatial information
+        avg_out = self.avg_pool(inputs)
+        max_out = self.max_pool(inputs)
+        
+        #pass pooled outputs through fully connected layers
+        avg_out = self.fc2(self.fc1(avg_out))
+        max_out = self.fc2(self.fc1(max_out))
+        
+        #combine outputs and reshape to match input dimensions
+        out = avg_out + max_out
+        out = tf.expand_dims(tf.expand_dims(out, axis = 1), axis = 1)
+        
+        #scale input features by channel attention output
+        return inputs * out
 
 #function to read, unpack, and prepare audio dataset paths and labels
 def read_file(gz_path):
@@ -114,15 +148,12 @@ def plot_history(history):
     plt.tight_layout()
     plt.show()
 
-#read dataset, generate audio paths and labels
 all_audio_paths, all_labels = read_file(dataset_path)
 num_labels = len(np.unique(all_labels))
 
-#encode labels to numerical values
 label_encoder = LabelEncoder()
 all_labels_encoded = label_encoder.fit_transform(all_labels)
 
-#split audio paths and labels into training and validation sets
 train_paths, val_paths, train_labels, val_labels = train_test_split(
     all_audio_paths, all_labels_encoded, test_size=0.02, random_state=42, stratify=all_labels_encoded
 )
@@ -132,7 +163,6 @@ val_dataset = paths_and_labels_to_dataset(val_paths, val_labels)
 train_dataset = prepare_for_training(train_dataset)
 val_dataset = prepare_for_training(val_dataset)
 
-#map dataset to spectrogram and labels for model input
 train_spec = train_dataset.map(map_func=get_spectrogram_and_label_id, num_parallel_calls=tf.data.AUTOTUNE)
 val_spec = val_dataset.map(map_func=get_spectrogram_and_label_id, num_parallel_calls=tf.data.AUTOTUNE)
 
@@ -145,16 +175,18 @@ for aux_spect, _ in train_spec.take(1):
 #model definition
 model_spectrogram = models.Sequential([
     layers.Input(shape=input_shape),
-    layers.Resizing(32, 32),
-    norm_layer,
-    layers.Conv2D(32, 3, activation='relu'),
-    layers.Conv2D(64, 3, activation='relu'),
-    layers.MaxPooling2D(),
-    layers.Dropout(0.25),
-    layers.Flatten(),
-    layers.Dense(128, activation='relu'),
-    layers.Dropout(0.5),
-    layers.Dense(num_labels, activation='softmax')
+    layers.Resizing(32, 32),                        #resize input to fixed dimensions
+    norm_layer,                                     #apply normalization to input data
+    layers.Conv2D(32, 3, activation='relu'),        #convolution layer with 32 filters
+    ChannelAttention(ratio = 8),                    #apply channel attention after Conv2D layer
+    layers.Conv2D(64, 3, activation='relu'),        #second convolution layer with 64 filters
+    ChannelAttention(ratio = 8),                    #apply another channel attention
+    layers.MaxPooling2D(),                          #reduce feature map dimensions
+    layers.Dropout(0.25),                           #apply dropout for regularization
+    layers.Flatten(),                               #flatten feature maps for dense layer
+    layers.Dense(128, activation='relu'),           #fully connected dense layer
+    layers.Dropout(0.5),                            #dropout for dense layer regularization
+    layers.Dense(num_labels, activation='softmax')  #output layer with softmax activation
 ])
 
 model_spectrogram.compile(
@@ -163,16 +195,17 @@ model_spectrogram.compile(
     metrics=['accuracy']
 )
 
+#set up model saving path and training callbacks for checkpointing and early stopping
 model_save_path = os.path.join(models_dir, "speech_to_text.keras")
-checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(model_save_path, save_best_only=True, monitor='val_loss')
-early_stopping_cb = tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True)
-tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=logs_dir)
+checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(model_save_path, save_best_only = True, monitor = 'val_loss')
+early_stopping_cb = tf.keras.callbacks.EarlyStopping(patience = 8, restore_best_weights = True)
+tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir = logs_dir)
 
 history_freq_time_domain = model_spectrogram.fit(
     train_spec,
-    epochs=20,
-    validation_data=val_spec,
-    callbacks=[checkpoint_cb, early_stopping_cb, tensorboard_cb]
+    epochs = 20,
+    validation_data = val_spec,
+    callbacks = [checkpoint_cb, early_stopping_cb, tensorboard_cb]
 )
 
 plot_history(history_freq_time_domain)
